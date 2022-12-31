@@ -1,0 +1,35 @@
+Target dependency graph (11 targets)
+PromisesObjC in Pods, no dependencies
+GoogleUtilities in Pods, depends on:
+PromisesObjC in Pods (explicit)
+FirebaseCoreInternal in Pods, depends on:
+GoogleUtilities in Pods (explicit)
+FirebaseCore in Pods, depends on:
+FirebaseCoreInternal in Pods (explicit)
+GoogleUtilities in Pods (explicit)
+leveldb-library in Pods, no dependencies
+FirebaseDatabase in Pods, depends on:
+FirebaseCore in Pods (explicit)
+leveldb-library in Pods (explicit)
+Firebase in Pods, depends on:
+FirebaseCore in Pods (explicit)
+FirebaseDatabase in Pods (explicit)
+FlutterMacOS in Pods, no dependencies
+firebase_core in Pods, depends on:
+Firebase in Pods (explicit)
+FlutterMacOS in Pods (explicit)
+firebase_database in Pods, depends on:
+Firebase in Pods (explicit)
+FlutterMacOS in Pods (explicit)
+firebase_core in Pods (explicit)
+Pods-Runner in Pods, depends on:
+Firebase in Pods (explicit)
+FirebaseCore in Pods (explicit)
+FirebaseCoreInternal in Pods (explicit)
+FirebaseDatabase in Pods (explicit)
+FlutterMacOS in Pods (explicit)
+GoogleUtilities in Pods (explicit)
+PromisesObjC in Pods (explicit)
+firebase_core in Pods (explicit)
+firebase_database in Pods (explicit)
+leveldb-library in Pods (explicit)
