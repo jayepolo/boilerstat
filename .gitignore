@@ -1,0 +1,46 @@
+# Environment configuration
+.env
+postgres-db/.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+*.egg-info/
+
+# Node.js
+web/node_modules/
+web/build/
+build/
+web/npm-debug.log*
+web/yarn-debug.log*
+web/yarn-error.log*
+
+# Database
+data/
+*.db
+*.sqlite
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Docker
+.dockerignore
+
+# Claude Code settings
+.claude/
+
+# ESP32 configuration with real credentials
+config.h

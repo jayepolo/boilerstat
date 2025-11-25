@@ -1,0 +1,60 @@
+services:
+  boilerstat-listener:
+    build: .
+    container_name: boilerstat-listener
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - .env
+    volumes:
+      # Keep data volume for backwards compatibility
+      - boilerstat-data:/data
+      - ./data:/data
+
+  boilerstat-aggregator:
+    build: .
+    container_name: boilerstat-aggregator
+    restart: unless-stopped
+    network_mode: host
+    entrypoint: []
+    command: ["python3", "/app/data_aggregator.py"]
+    env_file:
+      - .env
+    environment:
+      - RAW_DATA_RETENTION_HOURS=3
+      - LOG_LEVEL=INFO
+    volumes:
+      # Keep data volume for backwards compatibility
+      - boilerstat-data:/data
+      - ./data:/data
+    depends_on:
+      - boilerstat-listener
+
+  boilerstat-dashboard:
+    build: 
+      context: .
+      dockerfile: ./web/Dockerfile
+    container_name: boilerstat-dashboard
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - .env
+    volumes:
+      # Keep data volume for backwards compatibility
+      - boilerstat-data:/data
+      - ./data:/data
+    depends_on:
+      - boilerstat-listener
+
+volumes:
+  boilerstat-data:
+    driver: local
+    # Optional: specify exact location on host
+    # driver_opts:
+    #   type: none
+    #   o: bind
+    #   device: /home/your-user/boilerstat/data
+
+networks:
+  traefik:
+    external: true
