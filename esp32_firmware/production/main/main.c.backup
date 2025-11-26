@@ -1,0 +1,382 @@
+/*
+ * ESP32 BoilerStat Simulator - ESP-IDF Native Implementation
+ * 
+ * Emulates boiler sensor readings and publishes them via MQTT
+ * Compatible with the Python mqtt_simulator.py data format
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+#include <sys/time.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "esp_system.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "esp_sntp.h"
+#include "lwip/err.h"
+#include "lwip/sys.h"
+#include "mqtt_client.h"
+#include "cJSON.h"
+#include "driver/gpio.h"
+
+// Configuration Constants
+#define WIFI_SSID "Apponaug-WiFi"
+#define WIFI_PASSWORD "Ollie+Millie"
+#define MQTT_BROKER_URI "mqtt://192.168.1.245:1883"
+#define MQTT_TOPIC "boilerstat/reading"
+#define PUBLISH_INTERVAL_MS (5 * 1000)  // 5 seconds
+
+// LED Configuration
+#define LED_GPIO_PIN GPIO_NUM_2  // Built-in LED on most ESP32 boards
+#define LED_ON_LEVEL 1           // LED turns on with HIGH signal
+#define LED_OFF_LEVEL 0          // LED turns off with LOW signal
+
+// WiFi Event Bits
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_FAIL_BIT BIT1
+
+// Global Variables
+static const char *TAG = "BOILERSTAT_SIM";
+static EventGroupHandle_t s_wifi_event_group;
+static esp_mqtt_client_handle_t mqtt_client;
+static int s_retry_num = 0;
+static bool wifi_connected = false;
+static bool mqtt_connected = false;
+static int publish_count = 1;
+
+// Function Prototypes
+static void wifi_init_sta(void);
+static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data);
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
+static void mqtt_app_start(void);
+static void led_init(void);
+static void led_flash_wifi_connected(void);
+static void led_flash_mqtt_publish(void);
+static void led_set_level(int level);
+static void initialize_sntp(void);
+static void get_formatted_time(char *time_str, size_t max_len);
+static void publish_sensor_data_task(void *pvParameters);
+static cJSON* generate_sensor_reading(void);
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "ESP32 BoilerStat Simulator Starting...");
+    ESP_LOGI(TAG, "=====================================");
+    
+    // Initialize LED
+    led_init();
+    
+    // Initialize NVS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    // Initialize WiFi
+    wifi_init_sta();
+    
+    // Initialize SNTP for time synchronization
+    initialize_sntp();
+    
+    // Initialize MQTT
+    mqtt_app_start();
+    
+    ESP_LOGI(TAG, "Setup complete. Starting main loop...");
+    
+    // Create task for publishing sensor data
+    xTaskCreate(publish_sensor_data_task, "publish_task", 4096, NULL, 5, NULL);
+}
+
+static void wifi_init_sta(void)
+{
+    s_wifi_event_group = xEventGroupCreate();
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    esp_event_handler_instance_t instance_any_id;
+    esp_event_handler_instance_t instance_got_ip;
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &event_handler,
+                                                        NULL,
+                                                        &instance_any_id));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                        IP_EVENT_STA_GOT_IP,
+                                                        &event_handler,
+                                                        NULL,
+                                                        &instance_got_ip));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASSWORD,
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "Connecting to WiFi network: %s", WIFI_SSID);
+
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+            pdFALSE,
+            pdFALSE,
+            portMAX_DELAY);
+
+    if (bits & WIFI_CONNECTED_BIT) {
+        ESP_LOGI(TAG, "Connected to WiFi network: %s", WIFI_SSID);
+        wifi_connected = true;
+    } else if (bits & WIFI_FAIL_BIT) {
+        ESP_LOGI(TAG, "Failed to connect to WiFi network: %s", WIFI_SSID);
+        wifi_connected = false;
+    } else {
+        ESP_LOGE(TAG, "UNEXPECTED EVENT");
+    }
+}
+
+static void event_handler(void* arg, esp_event_base_t event_base,
+                               int32_t event_id, void* event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (s_retry_num < 10) {
+            esp_wifi_connect();
+            s_retry_num++;
+            ESP_LOGI(TAG, "Retry to connect to the AP");
+        } else {
+            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+        }
+        wifi_connected = false;
+        mqtt_connected = false;
+        ESP_LOGI(TAG,"Connect to the AP fail");
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "Got IP:" IPSTR, IP2STR(&event->ip_info.ip));
+        s_retry_num = 0;
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        wifi_connected = true;
+        
+        // Flash LED to indicate successful WiFi connection
+        led_flash_wifi_connected();
+    }
+}
+
+static void mqtt_app_start(void)
+{
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = MQTT_BROKER_URI,
+    };
+    
+    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_start(mqtt_client);
+    
+    ESP_LOGI(TAG, "MQTT client configured for broker: %s", MQTT_BROKER_URI);
+    ESP_LOGI(TAG, "Publishing to topic: %s", MQTT_TOPIC);
+}
+
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
+{
+    esp_mqtt_event_handle_t event = event_data;
+    
+    switch ((esp_mqtt_event_id_t)event_id) {
+    case MQTT_EVENT_CONNECTED:
+        ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
+        mqtt_connected = true;
+        break;
+    case MQTT_EVENT_DISCONNECTED:
+        ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
+        mqtt_connected = false;
+        break;
+    case MQTT_EVENT_SUBSCRIBED:
+        ESP_LOGI(TAG, "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id);
+        break;
+    case MQTT_EVENT_UNSUBSCRIBED:
+        ESP_LOGI(TAG, "MQTT_EVENT_UNSUBSCRIBED, msg_id=%d", event->msg_id);
+        break;
+    case MQTT_EVENT_PUBLISHED:
+        ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED, msg_id=%d", event->msg_id);
+        break;
+    case MQTT_EVENT_DATA:
+        ESP_LOGI(TAG, "MQTT_EVENT_DATA");
+        break;
+    case MQTT_EVENT_ERROR:
+        ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
+        break;
+    default:
+        ESP_LOGI(TAG, "Other event id:%d", event->event_id);
+        break;
+    }
+}
+
+static void initialize_sntp(void)
+{
+    ESP_LOGI(TAG, "Initializing SNTP");
+    esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_init();
+    
+    // Wait for time to be set
+    time_t now = 0;
+    struct tm timeinfo = { 0 };
+    int retry = 0;
+    const int retry_count = 10;
+    
+    while (sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET && ++retry < retry_count) {
+        ESP_LOGI(TAG, "Waiting for system time to be set... (%d/%d)", retry, retry_count);
+        vTaskDelay(2000 / portTICK_PERIOD_MS);
+    }
+    
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    ESP_LOGI(TAG, "Time synchronized");
+}
+
+static void get_formatted_time(char *time_str, size_t max_len)
+{
+    time_t now;
+    struct tm timeinfo;
+    
+    time(&now);
+    gmtime_r(&now, &timeinfo);
+    
+    strftime(time_str, max_len, "%Y-%m-%d %H:%M:%S", &timeinfo);
+}
+
+static cJSON* generate_sensor_reading(void)
+{
+    char time_str[20];
+    get_formatted_time(time_str, sizeof(time_str));
+    
+    cJSON *json = cJSON_CreateObject();
+    cJSON *timestamp = cJSON_CreateString(time_str);
+    cJSON *boiler_state = cJSON_CreateNumber(esp_random() % 2);
+    cJSON *zone_1 = cJSON_CreateNumber(esp_random() % 2);
+    cJSON *zone_2 = cJSON_CreateNumber(esp_random() % 2);
+    cJSON *zone_3 = cJSON_CreateNumber(esp_random() % 2);
+    cJSON *zone_4 = cJSON_CreateNumber(esp_random() % 2);
+    cJSON *zone_5 = cJSON_CreateNumber(esp_random() % 2);
+    cJSON *zone_6 = cJSON_CreateNumber(esp_random() % 2);
+    
+    cJSON_AddItemToObject(json, "timestamp", timestamp);
+    cJSON_AddItemToObject(json, "boiler_state", boiler_state);
+    cJSON_AddItemToObject(json, "zone_1", zone_1);
+    cJSON_AddItemToObject(json, "zone_2", zone_2);
+    cJSON_AddItemToObject(json, "zone_3", zone_3);
+    cJSON_AddItemToObject(json, "zone_4", zone_4);
+    cJSON_AddItemToObject(json, "zone_5", zone_5);
+    cJSON_AddItemToObject(json, "zone_6", zone_6);
+    
+    return json;
+}
+
+static void publish_sensor_data_task(void *pvParameters)
+{
+    while (1) {
+        if (wifi_connected && mqtt_connected) {
+            cJSON *sensor_data = generate_sensor_reading();
+            char *json_string = cJSON_Print(sensor_data);
+            
+            if (json_string != NULL) {
+                int msg_id = esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC, json_string, 0, 0, 0);
+                
+                if (msg_id >= 0) {
+                    cJSON *timestamp = cJSON_GetObjectItem(sensor_data, "timestamp");
+                    cJSON *boiler = cJSON_GetObjectItem(sensor_data, "boiler_state");
+                    cJSON *z1 = cJSON_GetObjectItem(sensor_data, "zone_1");
+                    cJSON *z2 = cJSON_GetObjectItem(sensor_data, "zone_2");
+                    cJSON *z3 = cJSON_GetObjectItem(sensor_data, "zone_3");
+                    cJSON *z4 = cJSON_GetObjectItem(sensor_data, "zone_4");
+                    cJSON *z5 = cJSON_GetObjectItem(sensor_data, "zone_5");
+                    cJSON *z6 = cJSON_GetObjectItem(sensor_data, "zone_6");
+                    
+                    ESP_LOGI(TAG, "[%d] Published at %s", publish_count, timestamp->valuestring);
+                    ESP_LOGI(TAG, "    Boiler: %d | Zones: %d %d %d %d %d %d", 
+                            (int)boiler->valuedouble, (int)z1->valuedouble, (int)z2->valuedouble, 
+                            (int)z3->valuedouble, (int)z4->valuedouble, (int)z5->valuedouble, (int)z6->valuedouble);
+                    ESP_LOGI(TAG, "    JSON: %s", json_string);
+                    
+                    // Flash LED to indicate successful MQTT publish
+                    led_flash_mqtt_publish();
+                    
+                    publish_count++;
+                } else {
+                    ESP_LOGW(TAG, "[%d] Publish failed!", publish_count);
+                }
+                
+                free(json_string);
+            }
+            
+            cJSON_Delete(sensor_data);
+        } else {
+            ESP_LOGW(TAG, "WiFi or MQTT not connected - skipping publish");
+        }
+        
+        vTaskDelay(PUBLISH_INTERVAL_MS / portTICK_PERIOD_MS);
+    }
+}
+
+// LED Control Functions
+static void led_init(void)
+{
+    // Configure LED GPIO pin
+    gpio_config_t io_conf = {
+        .intr_type = GPIO_INTR_DISABLE,
+        .mode = GPIO_MODE_OUTPUT,
+        .pin_bit_mask = (1ULL << LED_GPIO_PIN),
+        .pull_down_en = 0,
+        .pull_up_en = 0,
+    };
+    gpio_config(&io_conf);
+    
+    // Start with LED off
+    led_set_level(LED_OFF_LEVEL);
+    
+    ESP_LOGI(TAG, "LED initialized on GPIO %d", LED_GPIO_PIN);
+}
+
+static void led_set_level(int level)
+{
+    gpio_set_level(LED_GPIO_PIN, level);
+}
+
+static void led_flash_wifi_connected(void)
+{
+    ESP_LOGI(TAG, "WiFi connected - flashing LED 10 times");
+    
+    // Flash 10 times in 3 seconds = 300ms per flash cycle (150ms on, 150ms off)
+    for (int i = 0; i < 10; i++) {
+        led_set_level(LED_ON_LEVEL);
+        vTaskDelay(150 / portTICK_PERIOD_MS);
+        led_set_level(LED_OFF_LEVEL);
+        vTaskDelay(150 / portTICK_PERIOD_MS);
+    }
+}
+
+static void led_flash_mqtt_publish(void)
+{
+    // Flash 3 times in 1 second = 333ms per flash cycle (166ms on, 167ms off)
+    for (int i = 0; i < 3; i++) {
+        led_set_level(LED_ON_LEVEL);
+        vTaskDelay(166 / portTICK_PERIOD_MS);
+        led_set_level(LED_OFF_LEVEL);
+        if (i < 2) { // Don't delay after the last flash
+            vTaskDelay(167 / portTICK_PERIOD_MS);
+        }
+    }
+}
